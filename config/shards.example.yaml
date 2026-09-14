@@ -1,0 +1,17 @@
+# Example shard map config — shape that internal/config.Load will parse
+# once YAML loading is implemented. Not read by anything yet.
+
+listen_addr: ":5433"
+health_check_interval: 2s
+
+shards:
+  - id: shard-0
+    primary: "127.0.0.1:6543"
+    replicas:
+      - "127.0.0.1:6544"
+      - "127.0.0.1:6545"
+
+  - id: shard-1
+    primary: "127.0.0.1:6553"
+    replicas:
+      - "127.0.0.1:6554"
