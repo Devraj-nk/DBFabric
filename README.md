@@ -201,3 +201,38 @@ Each failure mode in step 5 is independently injectable against the flows above:
 - Kill a primary mid-write-burst → exercises the failover flow end-to-end, measure writes lost/duplicated and time-to-recovery.
 - Kill a replica → exercises the health-check flow (should just drop out of the eventual/bounded read pool, no failover needed).
 - Partition the proxy from a node (not kill it) → exercises the split-brain guard specifically, since the node is alive for clients but not for the proxy.
+
+## Known limitations / future extensions
+
+**The proxy itself is a single point of failure and a throughput ceiling.**
+Everything above is about making the *database tier* resilient (sharding,
+replica lag, failover of Postgres nodes) — the proxy process that sits in
+front of it isn't resilient by itself yet:
+
+- One proxy instance means one thing to crash. If it dies, every client
+  routed through it loses access to the entire shard fleet at once, even
+  though the underlying Postgres nodes are all healthy.
+- One proxy instance is also a hard throughput ceiling — it can only push as
+  many connections/bytes per second as one process on one machine.
+
+This is a real gap, but a different (and more conventional) problem than the
+one this project explores. The standard fix — how PgBouncer, ProxySQL, and
+Vitess's `vtgate` are actually deployed — is to run **N stateless proxy
+replicas behind a plain L4 load balancer**. That only works cleanly once the
+shard map is no longer private, in-memory state owned by a single process:
+`shardmap.Map`'s doc comment already flags this ("promotable to an external
+store (etcd/Consul) later if the proxy itself needs to run as more than one
+instance"), but that externalization isn't built yet. Until then, this
+project's proxy is a single instance by construction.
+
+Not addressed, and not currently planned as part of the core build order
+above:
+- Externalizing the shard map (etcd/Consul) so multiple proxy instances
+  agree on routing state instead of each holding its own.
+- Running multiple proxy instances behind a load balancer, plus whatever
+  health-checking that LB needs to stop routing to a dead instance.
+- Coordinating failover *decisions* across proxy instances once there's more
+  than one (right now a single checker goroutine owns that; multiple
+  instances all independently "detecting" and "promoting" the same dead
+  primary is its own small distributed-systems problem — likely wanting a
+  lease/leader-election so only one instance drives failover at a time).

@@ -14,6 +14,7 @@ import (
 type Config struct {
 	ListenAddr          string
 	HealthCheckInterval time.Duration
+	Backend             BackendConfig
 	Shards              []ShardConfig
 }
 
@@ -23,13 +24,32 @@ type ShardConfig struct {
 	Replicas []string
 }
 
+// BackendConfig is the credentials used to connect to every backend
+// node. The proxy assumes one uniform application role/database
+// across the shard fleet — see internal/pool.Backend, which this maps
+// onto directly.
+type BackendConfig struct {
+	User     string
+	Password string
+	Database string
+	SSLMode  string
+}
+
 // rawConfig mirrors the YAML shape directly. HealthCheckInterval stays
 // a string here (e.g. "2s") since yaml.v3 can't unmarshal a duration
 // string straight into a time.Duration; Load parses it afterward.
 type rawConfig struct {
 	ListenAddr          string           `yaml:"listen_addr"`
 	HealthCheckInterval string           `yaml:"health_check_interval"`
+	Backend             rawBackendConfig `yaml:"backend"`
 	Shards              []rawShardConfig `yaml:"shards"`
+}
+
+type rawBackendConfig struct {
+	User     string `yaml:"user"`
+	Password string `yaml:"password"`
+	Database string `yaml:"database"`
+	SSLMode  string `yaml:"sslmode"`
 }
 
 type rawShardConfig struct {
@@ -60,11 +80,23 @@ func Load(path string) (*Config, error) {
 	if len(raw.Shards) == 0 {
 		return nil, fmt.Errorf("config: %s defines no shards", path)
 	}
+	if raw.Backend.User == "" {
+		return nil, fmt.Errorf("config: backend.user is required")
+	}
+	if raw.Backend.Database == "" {
+		return nil, fmt.Errorf("config: backend.database is required")
+	}
 
 	cfg := &Config{
 		ListenAddr:          raw.ListenAddr,
 		HealthCheckInterval: interval,
-		Shards:              make([]ShardConfig, len(raw.Shards)),
+		Backend: BackendConfig{
+			User:     raw.Backend.User,
+			Password: raw.Backend.Password,
+			Database: raw.Backend.Database,
+			SSLMode:  raw.Backend.SSLMode,
+		},
+		Shards: make([]ShardConfig, len(raw.Shards)),
 	}
 
 	seen := make(map[string]bool, len(raw.Shards))

@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"time"
 )
 
 const (
@@ -203,14 +204,46 @@ func writeRowDescription(w io.Writer, columns []string) error {
 	return writeMessage(w, 'T', payload)
 }
 
-func writeDataRow(w io.Writer, values []string) error {
+// writeDataRow writes a DataRow for arbitrary Go values (as returned
+// by pgx's Rows.Values()), encoding each as Postgres text format. A
+// nil value encodes as SQL NULL (length -1, no bytes) rather than an
+// empty string — the two are distinct in the wire protocol.
+func writeDataRow(w io.Writer, values []any) error {
 	payload := make([]byte, 2)
 	binary.BigEndian.PutUint16(payload, uint16(len(values)))
 	for _, v := range values {
+		if v == nil {
+			payload = append(payload, 0xFF, 0xFF, 0xFF, 0xFF) // -1: SQL NULL
+			continue
+		}
+		text := formatPGValue(v)
 		lenBuf := make([]byte, 4)
-		binary.BigEndian.PutUint32(lenBuf, uint32(len(v)))
+		binary.BigEndian.PutUint32(lenBuf, uint32(len(text)))
 		payload = append(payload, lenBuf...)
-		payload = append(payload, v...)
+		payload = append(payload, text...)
 	}
 	return writeMessage(w, 'D', payload)
+}
+
+// formatPGValue renders a decoded column value the way Postgres's own
+// text format would, for the common cases this proxy is likely to see.
+// Not a complete implementation of Postgres's text output rules for
+// every type (arrays, composite types, etc. fall through to
+// fmt.Sprintf, which won't always match exactly).
+func formatPGValue(v any) string {
+	switch val := v.(type) {
+	case bool:
+		if val {
+			return "t"
+		}
+		return "f"
+	case []byte:
+		return string(val)
+	case time.Time:
+		return val.Format("2006-01-02 15:04:05.999999-07:00")
+	case fmt.Stringer:
+		return val.String()
+	default:
+		return fmt.Sprintf("%v", val)
+	}
 }

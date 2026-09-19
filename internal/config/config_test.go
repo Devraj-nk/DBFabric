@@ -18,6 +18,9 @@ func TestLoadExampleConfig(t *testing.T) {
 	if cfg.HealthCheckInterval != 2*time.Second {
 		t.Errorf("HealthCheckInterval = %v, want 2s", cfg.HealthCheckInterval)
 	}
+	if cfg.Backend.User != "postgres" || cfg.Backend.Database != "postgres" {
+		t.Errorf("Backend = %+v", cfg.Backend)
+	}
 	if len(cfg.Shards) != 2 {
 		t.Fatalf("len(Shards) = %d, want 2", len(cfg.Shards))
 	}
@@ -28,6 +31,16 @@ func TestLoadExampleConfig(t *testing.T) {
 		t.Errorf("Shards[0].Replicas = %v, want 2 entries", cfg.Shards[0].Replicas)
 	}
 }
+
+// validBackend is a valid `backend:` block to append to fixtures that
+// are testing something else, so those tests actually exercise the
+// validation rule they claim to — not fail earlier for an unrelated
+// missing-backend reason.
+const validBackend = `
+backend:
+  user: postgres
+  database: postgres
+`
 
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
@@ -48,6 +61,7 @@ func TestLoadInvalidDuration(t *testing.T) {
 	path := writeConfig(t, `
 listen_addr: ":5433"
 health_check_interval: "not-a-duration"
+`+validBackend+`
 shards:
   - id: shard-0
     primary: "127.0.0.1:6543"
@@ -61,6 +75,7 @@ func TestLoadNoShards(t *testing.T) {
 	path := writeConfig(t, `
 listen_addr: ":5433"
 health_check_interval: "2s"
+`+validBackend+`
 shards: []
 `)
 	if _, err := Load(path); err == nil {
@@ -68,10 +83,41 @@ shards: []
 	}
 }
 
+func TestLoadMissingBackendUser(t *testing.T) {
+	path := writeConfig(t, `
+listen_addr: ":5433"
+health_check_interval: "2s"
+backend:
+  database: postgres
+shards:
+  - id: shard-0
+    primary: "127.0.0.1:6543"
+`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error when backend.user is missing")
+	}
+}
+
+func TestLoadMissingBackendDatabase(t *testing.T) {
+	path := writeConfig(t, `
+listen_addr: ":5433"
+health_check_interval: "2s"
+backend:
+  user: postgres
+shards:
+  - id: shard-0
+    primary: "127.0.0.1:6543"
+`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected an error when backend.database is missing")
+	}
+}
+
 func TestLoadDuplicateShardID(t *testing.T) {
 	path := writeConfig(t, `
 listen_addr: ":5433"
 health_check_interval: "2s"
+`+validBackend+`
 shards:
   - id: shard-0
     primary: "127.0.0.1:6543"
@@ -87,6 +133,7 @@ func TestLoadMissingPrimary(t *testing.T) {
 	path := writeConfig(t, `
 listen_addr: ":5433"
 health_check_interval: "2s"
+`+validBackend+`
 shards:
   - id: shard-0
 `)

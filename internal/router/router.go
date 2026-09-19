@@ -14,8 +14,8 @@ type Consistency string
 
 const (
 	Strong           Consistency = "strong"           // read from primary
-	Eventual         Consistency = "eventual"          // read from any replica
-	BoundedStaleness Consistency = "bounded_staleness" // read from a replica only if lag < threshold
+	Eventual         Consistency = "eventual"          // read from any (healthy) replica
+	BoundedStaleness Consistency = "bounded_staleness" // read from a replica only if lag <= threshold
 )
 
 const defaultVnodesPerShard = 100
@@ -47,13 +47,14 @@ func (r *Router) AddShard(s *shardmap.Shard) {
 }
 
 // Resolve picks the node that should handle a query for shardKey
-// under the given consistency requirement.
+// under the given consistency requirement. maxLagMS is only
+// consulted for BoundedStaleness; pass 0 for the other levels.
 //
-// No health checker/failover exists yet (this is build-order step 1:
-// static shard map, route by hash, no failover). Bounded-staleness
-// falls back to primary for now — it will start consulting replica
-// lag once internal/health populates Node.LagMS.
-func (r *Router) Resolve(shardKey string, c Consistency) (shardmap.Node, error) {
+// A replica with Status == shardmap.StatusDown (as last reported by
+// internal/health) is never chosen — an unset Status (the zero value,
+// before the health checker's first sweep, or in tests that don't set
+// it) is treated as usable, not as known-bad.
+func (r *Router) Resolve(shardKey string, c Consistency, maxLagMS int64) (shardmap.Node, error) {
 	shardID, ok := r.ring.ShardFor(shardKey)
 	if !ok {
 		return shardmap.Node{}, fmt.Errorf("router: no shards registered")
@@ -67,25 +68,34 @@ func (r *Router) Resolve(shardKey string, c Consistency) (shardmap.Node, error) 
 	case Strong, "":
 		return shard.Primary, nil
 	case Eventual:
-		return pickReplica(shard, shardKey), nil
+		return pickReplica(shard, shardKey, -1), nil // -1: no lag ceiling, health is the only filter
 	case BoundedStaleness:
-		// TODO: once internal/health populates Node.LagMS, prefer a
-		// replica with LagMS below the caller's threshold and fall
-		// back to primary only if none qualify.
-		return shard.Primary, nil
+		return pickReplica(shard, shardKey, maxLagMS), nil
 	default:
 		return shardmap.Node{}, fmt.Errorf("router: unknown consistency level %q", c)
 	}
 }
 
-// pickReplica deterministically spreads a shard key across its
-// replicas (hash(key) mod len(replicas)) instead of tracking
-// round-robin state per shard. Falls back to primary if the shard has
-// no replicas registered yet.
-func pickReplica(s *shardmap.Shard, shardKey string) shardmap.Node {
-	if len(s.Replicas) == 0 {
+// pickReplica deterministically spreads a shard key across the
+// shard's usable replicas (hash(key) mod len(candidates)) instead of
+// tracking round-robin state per shard. A replica is a candidate if
+// it isn't marked DOWN and, when maxLagMS >= 0, its LagMS doesn't
+// exceed it. Falls back to primary if no replica qualifies (including
+// when the shard has none at all).
+func pickReplica(s *shardmap.Shard, shardKey string, maxLagMS int64) shardmap.Node {
+	candidates := make([]shardmap.Node, 0, len(s.Replicas))
+	for _, r := range s.Replicas {
+		if r.Status == shardmap.StatusDown {
+			continue
+		}
+		if maxLagMS >= 0 && r.LagMS > maxLagMS {
+			continue
+		}
+		candidates = append(candidates, r)
+	}
+	if len(candidates) == 0 {
 		return s.Primary
 	}
-	idx := hashKey(shardKey) % uint32(len(s.Replicas))
-	return s.Replicas[idx]
+	idx := hashKey(shardKey) % uint32(len(candidates))
+	return candidates[idx]
 }

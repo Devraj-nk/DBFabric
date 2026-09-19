@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,15 +14,36 @@ import (
 	"dbfabric/internal/shardmap"
 )
 
-func newTestListener() *Listener {
+// freeAddr returns a TCP address that is guaranteed to be refusing
+// connections: it briefly listens on an OS-assigned port, then closes
+// it, so nothing is bound there when the test runs a query against it.
+// Used to test the proxy's error path without needing a real Postgres
+// backend.
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	return addr
+}
+
+func newTestListener(t *testing.T) (l *Listener, primaryAddr, replicaAddr string) {
+	t.Helper()
+	primaryAddr = freeAddr(t)
+	replicaAddr = freeAddr(t)
+
 	sm := shardmap.New()
 	rt := router.New(sm)
 	rt.AddShard(&shardmap.Shard{
 		ID:       "shard-0",
-		Primary:  shardmap.Node{Addr: "primary-0"},
-		Replicas: []shardmap.Node{{Addr: "replica-0a"}},
+		Primary:  shardmap.Node{Addr: primaryAddr},
+		Replicas: []shardmap.Node{{Addr: replicaAddr}},
 	})
-	return NewListener(":0", rt, pool.NewManager())
+	pm := pool.NewManager(pool.Backend{User: "app", Database: "appdb"})
+	return NewListener(":0", rt, pm), primaryAddr, replicaAddr
 }
 
 // drainHandshake reads messages until (and including) ReadyForQuery,
@@ -39,8 +61,65 @@ func drainHandshake(t *testing.T, r *bufio.Reader) {
 	}
 }
 
-func TestHandleConn_HandshakeAndQueryRouting(t *testing.T) {
-	l := newTestListener()
+// sendQuery writes a simple-protocol Query message for query.
+func sendQuery(t *testing.T, client *bufio.ReadWriter, query string) {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := writeMessage(&buf, 'Q', cString(query)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write(buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Flush(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func terminate(t *testing.T, client *bufio.ReadWriter) {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := writeMessage(&buf, 'X', nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write(buf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Flush(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// decodeErrorMessage extracts the human-readable message field ('M')
+// from an ErrorResponse payload.
+func decodeErrorMessage(t *testing.T, payload []byte) string {
+	t.Helper()
+	// ErrorResponse's payload is [1-byte field code][C-string]... ending
+	// in a lone extra 0 (see writeErrorResponse) — the same "run of
+	// null-terminated strings, one more 0 to end the run" shape
+	// splitCStrings expects, just with each string's own field-code
+	// byte glued onto its front instead of a separate token.
+	fields, err := splitCStrings(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range fields {
+		if strings.HasPrefix(f, "M") {
+			return f[1:]
+		}
+	}
+	t.Fatalf("no message field ('M') found in ErrorResponse payload %q", payload)
+	return ""
+}
+
+// runQueryExpectingError drives one handshake+query+terminate cycle
+// against a fresh connection and returns the ErrorResponse message
+// text — used to confirm both that a query failed and, by checking
+// which address appears in the message, that it was routed correctly
+// before the (inevitable, since nothing is listening) connection
+// failure.
+func runQueryExpectingError(t *testing.T, l *Listener, appName, query string) string {
+	t.Helper()
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 
@@ -52,85 +131,63 @@ func TestHandleConn_HandshakeAndQueryRouting(t *testing.T) {
 
 	client := bufio.NewReadWriter(bufio.NewReader(clientConn), bufio.NewWriter(clientConn))
 
-	startup := buildStartupMessage(map[string]string{
-		"user":             "app",
-		"application_name": "user-42",
-	})
+	startup := buildStartupMessage(map[string]string{"user": "app", "application_name": appName})
 	if _, err := client.Write(startup); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.Flush(); err != nil {
 		t.Fatal(err)
 	}
-
 	drainHandshake(t, client.Reader)
 
-	var qbuf bytes.Buffer
-	if err := writeMessage(&qbuf, 'Q', cString("-- consistency=eventual\nSELECT 1")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.Write(qbuf.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Flush(); err != nil {
-		t.Fatal(err)
-	}
-
-	msgType, _, err := readMessage(client.Reader)
-	if err != nil || msgType != 'T' {
-		t.Fatalf("expected RowDescription ('T'), got %q, err=%v", msgType, err)
-	}
+	sendQuery(t, client, query)
 
 	msgType, payload, err := readMessage(client.Reader)
-	if err != nil || msgType != 'D' {
-		t.Fatalf("expected DataRow ('D'), got %q, err=%v", msgType, err)
+	if err != nil || msgType != 'E' {
+		t.Fatalf("expected ErrorResponse ('E'), got %q, err=%v", msgType, err)
 	}
-	values := decodeDataRow(t, payload)
-	if len(values) != 3 {
-		t.Fatalf("expected 3 columns, got %d: %v", len(values), values)
-	}
-	if values[0] != "user-42" {
-		t.Errorf("shard_key = %q, want %q", values[0], "user-42")
-	}
-	if values[1] != string(router.Eventual) {
-		t.Errorf("consistency = %q, want %q", values[1], router.Eventual)
-	}
-	if values[2] != "replica-0a" {
-		t.Errorf("routed_to = %q, want %q", values[2], "replica-0a")
-	}
+	msg := decodeErrorMessage(t, payload)
 
-	msgType, _, err = readMessage(client.Reader)
-	if err != nil || msgType != 'C' {
-		t.Fatalf("expected CommandComplete ('C'), got %q, err=%v", msgType, err)
-	}
-
-	// A real client (psql included) blocks waiting for this before it'll
-	// consider the query done — this is the follow-up ReadyForQuery.
 	msgType, _, err = readMessage(client.Reader)
 	if err != nil || msgType != 'Z' {
-		t.Fatalf("expected trailing ReadyForQuery ('Z'), got %q, err=%v", msgType, err)
+		t.Fatalf("expected ReadyForQuery ('Z') after the error, got %q, err=%v", msgType, err)
 	}
 
-	var termBuf bytes.Buffer
-	if err := writeMessage(&termBuf, 'X', nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.Write(termBuf.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-	if err := client.Flush(); err != nil {
-		t.Fatal(err)
-	}
-
+	terminate(t, client)
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("handleConn did not exit after Terminate")
 	}
+
+	return msg
 }
 
-func TestHandleConn_DefaultsToStrongConsistency(t *testing.T) {
-	l := newTestListener()
+func TestHandleConn_RoutesEventualToReplicaBeforeFailingToConnect(t *testing.T) {
+	l, _, replicaAddr := newTestListener(t)
+
+	// Only one shard is registered, so every key maps to it; Eventual
+	// picks its (only) replica. The backend connection then fails
+	// because nothing is listening on that address — but the error
+	// message names the address it tried, proving routing chose the
+	// replica, not the primary.
+	msg := runQueryExpectingError(t, l, "user-42", "-- consistency=eventual\nSELECT 1")
+	if !strings.Contains(msg, replicaAddr) {
+		t.Errorf("error message %q does not mention the replica address %q — routing may be wrong", msg, replicaAddr)
+	}
+}
+
+func TestHandleConn_DefaultsToStrongConsistencyRoutesToPrimary(t *testing.T) {
+	l, primaryAddr, _ := newTestListener(t)
+
+	msg := runQueryExpectingError(t, l, "user-42", "SELECT 1") // no consistency hint
+	if !strings.Contains(msg, primaryAddr) {
+		t.Errorf("error message %q does not mention the primary address %q — routing may be wrong", msg, primaryAddr)
+	}
+}
+
+func TestHandleConn_ConnectionStaysUsableAfterAQueryError(t *testing.T) {
+	l, primaryAddr, _ := newTestListener(t)
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 
@@ -141,37 +198,29 @@ func TestHandleConn_DefaultsToStrongConsistency(t *testing.T) {
 	}()
 
 	client := bufio.NewReadWriter(bufio.NewReader(clientConn), bufio.NewWriter(clientConn))
-
-	startup := buildStartupMessage(map[string]string{"user": "app", "application_name": "user-42"})
+	startup := buildStartupMessage(map[string]string{"user": "app", "application_name": "user-1"})
 	client.Write(startup)
 	client.Flush()
 	drainHandshake(t, client.Reader)
 
-	var qbuf bytes.Buffer
-	writeMessage(&qbuf, 'Q', cString("SELECT 1")) // no consistency hint
-	client.Write(qbuf.Bytes())
-	client.Flush()
-
-	readMessage(client.Reader) // RowDescription
-	_, payload, err := readMessage(client.Reader)
-	if err != nil {
-		t.Fatal(err)
+	// First query fails (no real backend); the connection must still
+	// accept a second query afterward rather than being left unusable.
+	for i := 0; i < 2; i++ {
+		sendQuery(t, client, "SELECT 1")
+		msgType, payload, err := readMessage(client.Reader)
+		if err != nil || msgType != 'E' {
+			t.Fatalf("query %d: expected ErrorResponse, got %q, err=%v", i, msgType, err)
+		}
+		if !strings.Contains(decodeErrorMessage(t, payload), primaryAddr) {
+			t.Errorf("query %d: error message did not mention %q", i, primaryAddr)
+		}
+		msgType, _, err = readMessage(client.Reader)
+		if err != nil || msgType != 'Z' {
+			t.Fatalf("query %d: expected ReadyForQuery, got %q, err=%v", i, msgType, err)
+		}
 	}
-	values := decodeDataRow(t, payload)
-	if values[1] != string(router.Strong) {
-		t.Errorf("consistency = %q, want %q (default)", values[1], router.Strong)
-	}
-	if values[2] != "primary-0" {
-		t.Errorf("routed_to = %q, want primary-0", values[2])
-	}
-	readMessage(client.Reader) // CommandComplete
-	readMessage(client.Reader) // ReadyForQuery
 
-	var termBuf bytes.Buffer
-	writeMessage(&termBuf, 'X', nil)
-	client.Write(termBuf.Bytes())
-	client.Flush()
-
+	terminate(t, client)
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):

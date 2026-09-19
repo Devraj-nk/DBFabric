@@ -4,6 +4,12 @@
 listen_addr: ":5433"
 health_check_interval: 2s
 
+backend:
+  user: postgres
+  password: ""
+  database: postgres
+  sslmode: disable
+
 shards:
   - id: shard-0
     primary: "127.0.0.1:6543"

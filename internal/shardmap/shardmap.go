@@ -60,3 +60,18 @@ func (m *Map) Set(shardID string, s *Shard) {
 	defer m.mu.Unlock()
 	m.shards[shardID] = s
 }
+
+// All returns a snapshot of every shard currently in the map, for
+// callers that need to iterate all of them (the health checker's
+// heartbeat sweep). The returned *Shard values are the same ones
+// stored in the map — safe to read, but per Set's doc comment, never
+// mutate one in place; replace it with Set instead.
+func (m *Map) All() []*Shard {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Shard, 0, len(m.shards))
+	for _, s := range m.shards {
+		out = append(out, s)
+	}
+	return out
+}

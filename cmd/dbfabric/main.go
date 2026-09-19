@@ -27,8 +27,13 @@ func main() {
 
 	sm := shardmap.New()
 	rt := router.New(sm)
-	pm := pool.NewManager()
-	_ = health.NewChecker(sm, cfg.HealthCheckInterval) // TODO: run hc.Run(ctx) once heartbeats are implemented
+	pm := pool.NewManager(pool.Backend{
+		User:     cfg.Backend.User,
+		Password: cfg.Backend.Password,
+		Database: cfg.Backend.Database,
+		SSLMode:  cfg.Backend.SSLMode,
+	})
+	hc := health.NewChecker(sm, pm, cfg.HealthCheckInterval)
 
 	for _, s := range cfg.Shards {
 		shard := &shardmap.Shard{ID: s.ID, Primary: shardmap.Node{Addr: s.Primary}}
@@ -40,6 +45,12 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+
+	go func() {
+		if err := hc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("health checker stopped: %v", err)
+		}
+	}()
 
 	lis := proxy.NewListener(cfg.ListenAddr, rt, pm)
 	log.Printf("dbfabric: listening on %s (%d shard(s) loaded from %s)", cfg.ListenAddr, len(cfg.Shards), *configPath)

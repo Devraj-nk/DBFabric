@@ -61,7 +61,6 @@ func (l *Listener) Run(ctx context.Context) error {
 // handshake, then a loop of simple-query messages until the client
 // terminates or a read/write fails.
 func (l *Listener) handleConn(ctx context.Context, conn net.Conn) {
-	_ = ctx // per-connection cancellation isn't wired up yet; Run() closing the listener stops new Accepts
 	defer conn.Close()
 
 	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
@@ -104,7 +103,7 @@ func (l *Listener) handleConn(ctx context.Context, conn net.Conn) {
 		switch msgType {
 		case 'Q':
 			query := strings.TrimRight(string(payload), "\x00")
-			if err := handleQuery(rw, l.router, shardKey, query); err != nil {
+			if err := handleQuery(ctx, rw, l.router, l.pools, shardKey, query); err != nil {
 				return
 			}
 		case 'X':

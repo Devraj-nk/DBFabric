@@ -167,7 +167,7 @@ func decodeDataRow(t *testing.T, payload []byte) []string {
 
 func TestWriteDataRow(t *testing.T) {
 	var buf bytes.Buffer
-	if err := writeDataRow(&buf, []string{"a", "bb", "ccc"}); err != nil {
+	if err := writeDataRow(&buf, []any{"a", "bb", "ccc"}); err != nil {
 		t.Fatal(err)
 	}
 	msgType, payload, err := readMessage(&buf)
@@ -186,5 +186,50 @@ func TestWriteDataRow(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("got[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestWriteDataRow_NullAndTypedValues(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeDataRow(&buf, []any{nil, true, false, 42, "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	_, payload, err := readMessage(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	count := binary.BigEndian.Uint16(payload[0:2])
+	if count != 5 {
+		t.Fatalf("column count = %d, want 5", count)
+	}
+	offset := 2
+
+	// nil -> SQL NULL: length -1, no bytes.
+	length := binary.BigEndian.Uint32(payload[offset : offset+4])
+	if int32(length) != -1 {
+		t.Errorf("nil value encoded length = %d, want -1", int32(length))
+	}
+	offset += 4
+
+	readNext := func() string {
+		l := binary.BigEndian.Uint32(payload[offset : offset+4])
+		offset += 4
+		v := string(payload[offset : offset+int(l)])
+		offset += int(l)
+		return v
+	}
+
+	if v := readNext(); v != "t" {
+		t.Errorf("true encoded as %q, want %q", v, "t")
+	}
+	if v := readNext(); v != "f" {
+		t.Errorf("false encoded as %q, want %q", v, "f")
+	}
+	if v := readNext(); v != "42" {
+		t.Errorf("42 encoded as %q, want %q", v, "42")
+	}
+	if v := readNext(); v != "hi" {
+		t.Errorf(`"hi" encoded as %q, want %q`, v, "hi")
 	}
 }
