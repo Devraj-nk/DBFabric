@@ -4,7 +4,7 @@ Sharded, Replicated Database Proxy — Deep Dive
 
 ## Core idea
 
-You sit a proxy between your application and a set of Postgres/MySQL instances. The app talks only to the proxy; the proxy decides which physical database handles each query.
+This is a proxy between your application and a set of Postgres/MySQL instances. The app talks only to the proxy; the proxy decides which physical database handles each query.
 
 ## Architecture components
 
@@ -60,62 +60,81 @@ Cost: more verbose than a dynamic language (explicit `if err != nil` on the hot 
 ## High-level design
 
 ```
-                         ┌─────────────────────────────┐
-                         │           Clients            │
-                         │  (apps speaking Postgres wire│
+                         ┌───────────────────────────────┐
+                         │           Clients             │
+                         │  (apps speaking Postgres wire │
                          │   protocol, unmodified)       │
                          └───────────────┬───────────────┘
                                          │
                                          ▼
-                         ┌─────────────────────────────┐
-                         │            PROXY              │
-                         │                                │
-                         │  ┌──────────────────────────┐  │
-                         │  │  Listener / Session Mgr   │  │  data plane
-                         │  │  (net.Listener,            │  │
-                         │  │   one goroutine/conn)      │  │
-                         │  └────────────┬─────────────┘  │
-                         │               ▼                 │
-                         │  ┌──────────────────────────┐  │
-                         │  │        Router             │  │
+                         ┌──────────────────────────────────┐
+                         │            PROXY                 │
+                         │                                  │
+                         │  ┌───────────────────────────┐   │
+                         │  │  Listener / Session Mgr   │   │  data plane
+                         │  │  (net.Listener,           │   │
+                         │  │   one goroutine/conn)     │   │
+                         │  └────────────┬──────────────┘   │
+                         │               ▼                  │
+                         │  ┌────────────────────────────┐  │
+                         │  │        Router              │  │
                          │  │  - extract shard key       │  │
                          │  │  - consistent hash lookup  │  │
                          │  │  - consistency-level logic │  │
-                         │  └────────────┬─────────────┘   │
+                         │  └────────────┬───────────────┘  │
                          │               ▼                  │
                          │  ┌────────────────────────────┐  │
                          │  │   Connection Pool Manager  │  │
                          │  │  (per-node pools, bulkhead │  │
                          │  │   isolation on failure)    │  │
                          │  └────────────┬───────────────┘  │
-                         │               │                 │
-                         │  ┌────────────┴─────────────┐  │
+                         │               │                  │
+                         │  ┌────────────┴───────────────┐  │
                          │  │      Shard Map (state)     │  │  control plane
-                         │  │  shard_key_range → primary  │  │
+                         │  │  shard_key_range → primary │  │
                          │  │  + replica set + lag info  │  │
-                         │  └────────────┬─────────────┘  │
-                         │               ▲                 │
-                         │  ┌────────────┴─────────────┐  │
+                         │  └────────────┬───────────────┘  │
+                         │               ▲                  │
+                         │  ┌────────────┴───────────────┐  │
                          │  │  Health Checker /          │  │
                          │  │  Failover Controller       │  │
                          │  │  (heartbeats, promotion,   │  │
                          │  │   split-brain guards)      │  │
-                         │  └──────────────────────────┘  │
-                         │                                │
-                         │  ┌──────────────────────────┐  │
-                         │  │  Metrics / Observability   │  │
-                         │  │  (Prometheus exporter)     │  │
-                         │  └──────────────────────────┘  │
-                         └───────────────┬───────────────┘
+                         │  └────────────────────────────┘  │
+                         │                                  │
+                         │  ┌───────────────────────────┐   │
+                         │  │  Metrics / Observability  │   │
+                         │  │  (Prometheus exporter)    │   │
+                         │  └───────────────────────────┘   │
+                         └───────────────┬──────────────────┘
                                          │
               ┌──────────────────────────┼──────────────────────────┐
               ▼                          ▼                          ▼
       ┌───────────────┐          ┌───────────────┐          ┌───────────────┐
-      │   Shard 1      │          │   Shard 2      │          │   Shard N      │
-      │ Primary + N    │          │ Primary + N    │          │ Primary + N    │
-      │ Replicas       │          │ Replicas       │          │ Replicas       │
-      │ (Postgres)     │          │ (Postgres)     │          │ (Postgres)     │
+      │   Shard 1     │          │   Shard 2     │          │   Shard N     │
+      │ Primary + N   │          │ Primary + N   │          │ Primary + N   │
+      │ Replicas      │          │ Replicas      │          │ Replicas      │
+      │ (Postgres)    │          │ (Postgres)    │          │ (Postgres)    │
       └───────────────┘          └───────────────┘          └───────────────┘
+```
+
+## Layout
+one package per HLD component from the README:
+
+```
+DBFabric/
+├── go.mod                          module dbfabric, go 1.22 — stdlib only, no deps yet
+├── Makefile                        build/run/test/tidy targets
+├── .gitignore
+├── cmd/dbfabric/main.go            wires everything together (stub)
+├── config/shards.example.yaml      shape internal/config will eventually parse
+└── internal/
+    ├── shardmap/shardmap.go        routing table: shard ID → {primary, replicas, lag}
+    ├── router/router.go, hash.go   shard-key resolution + consistency routing (stubs)
+    ├── pool/pool.go                per-node connection pool manager (Get/Drain implemented)
+    ├── health/checker.go, failover.go   heartbeat loop + failover controller (stubs)
+    ├── proxy/listener.go           TCP accept loop, one goroutine/conn (accept loop works, query handling is a stub)
+    └── metrics/metrics.go          TODO for prometheus wiring
 ```
 
 ### Component responsibilities

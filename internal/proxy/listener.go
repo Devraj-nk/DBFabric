@@ -5,8 +5,13 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
+	"fmt"
+	"io"
+	"log"
 	"net"
+	"strings"
 
 	"dbfabric/internal/pool"
 	"dbfabric/internal/router"
@@ -26,10 +31,6 @@ func NewListener(addr string, rt *router.Router, pm *pool.Manager) *Listener {
 
 // Run starts accepting connections and blocks until ctx is cancelled
 // or the listener fails.
-//
-// TODO: per-connection goroutine that speaks the Postgres wire
-// protocol, extracts the shard key/consistency hint per query, and
-// forwards to the node the router resolves.
 func (l *Listener) Run(ctx context.Context) error {
 	lis, err := net.Listen("tcp", l.addr)
 	if err != nil {
@@ -56,7 +57,73 @@ func (l *Listener) Run(ctx context.Context) error {
 	}
 }
 
+// handleConn drives one client connection end to end: the startup
+// handshake, then a loop of simple-query messages until the client
+// terminates or a read/write fails.
 func (l *Listener) handleConn(ctx context.Context, conn net.Conn) {
+	_ = ctx // per-connection cancellation isn't wired up yet; Run() closing the listener stops new Accepts
 	defer conn.Close()
-	// TODO: wire protocol handshake, query loop, routing, forwarding.
+
+	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+
+	params, err := readStartupParams(rw)
+	if err != nil {
+		log.Printf("proxy: startup handshake with %s failed: %v", conn.RemoteAddr(), err)
+		return
+	}
+	shardKey := shardKeyFromParams(params)
+
+	if err := writeAuthenticationOK(rw); err != nil {
+		return
+	}
+	if err := writeParameterStatus(rw, "server_version", "14.0 (dbfabric)"); err != nil {
+		return
+	}
+	if err := writeParameterStatus(rw, "client_encoding", "UTF8"); err != nil {
+		return
+	}
+	if err := writeBackendKeyData(rw, 0, 0); err != nil {
+		return
+	}
+	if err := writeReadyForQuery(rw, 'I'); err != nil {
+		return
+	}
+	if err := rw.Flush(); err != nil {
+		return
+	}
+
+	for {
+		msgType, payload, err := readMessage(rw.Reader)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("proxy: reading message from %s: %v", conn.RemoteAddr(), err)
+			}
+			return
+		}
+
+		switch msgType {
+		case 'Q':
+			query := strings.TrimRight(string(payload), "\x00")
+			if err := handleQuery(rw, l.router, shardKey, query); err != nil {
+				return
+			}
+		case 'X':
+			return
+		default:
+			if err := writeErrorResponse(rw, "ERROR", "0A000", fmt.Sprintf("unsupported message type %q", msgType)); err != nil {
+				return
+			}
+		}
+
+		// The simple query protocol requires a ReadyForQuery after every
+		// command (success or error) — without it a real client (psql
+		// included) blocks forever waiting for the backend to say it can
+		// accept the next command.
+		if err := writeReadyForQuery(rw, 'I'); err != nil {
+			return
+		}
+		if err := rw.Flush(); err != nil {
+			return
+		}
+	}
 }
