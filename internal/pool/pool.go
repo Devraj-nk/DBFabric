@@ -82,15 +82,49 @@ func (m *Manager) Get(ctx context.Context, addr string) (*pgxpool.Pool, error) {
 	return p, nil
 }
 
-// Drain closes and removes a node's pool, e.g. after the health
-// checker marks it DOWN. In-flight queries against it should fail
-// fast and be surfaced to the client rather than silently retried by
-// the proxy, to avoid duplicate writes.
+// Close closes every node's pool. Call it once at shutdown; the Manager
+// is not usable afterward.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	pools := m.pools
+	m.pools = make(map[string]*pgxpool.Pool)
+	m.mu.Unlock()
+
+	// pgxpool.Pool.Close blocks until every checked-out connection is
+	// returned, so it must never run under m.mu: one slow query on a dead
+	// node would otherwise freeze Get for every other node too.
+	for _, p := range pools {
+		p.Close()
+	}
+}
+
+// Drain removes a node's pool from the manager, e.g. after the health
+// checker marks it DOWN, so no new query can be routed through it, and
+// then closes it. Queries already running on it are not interrupted:
+// Close waits for them to return their connection (they fail on their
+// own once the node's TCP connections break), so Drain can block for as
+// long as the slowest such query — callers that can't afford that should
+// call it from a goroutine. The proxy never silently retries a query
+// that failed on a drained pool, to avoid duplicate writes.
 func (m *Manager) Drain(addr string) {
+	if p := m.detach(addr); p != nil {
+		p.Close()
+	}
+}
+
+// DrainAsync is Drain with the (potentially slow) close done in the
+// background. The detach — the part that stops new queries being routed
+// through the node — still happens before it returns.
+func (m *Manager) DrainAsync(addr string) {
+	if p := m.detach(addr); p != nil {
+		go p.Close()
+	}
+}
+
+func (m *Manager) detach(addr string) *pgxpool.Pool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if p, ok := m.pools[addr]; ok {
-		p.Close()
-		delete(m.pools, addr)
-	}
+	p := m.pools[addr]
+	delete(m.pools, addr)
+	return p
 }

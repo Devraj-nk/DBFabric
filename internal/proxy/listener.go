@@ -20,13 +20,17 @@ import (
 // Listener accepts client TCP connections, one goroutine per
 // connection.
 type Listener struct {
-	addr   string
-	router *router.Router
-	pools  *pool.Manager
+	addr            string
+	router          *router.Router
+	pools           *pool.Manager
+	defaultMaxLagMS int64
 }
 
-func NewListener(addr string, rt *router.Router, pm *pool.Manager) *Listener {
-	return &Listener{addr: addr, router: rt, pools: pm}
+// NewListener builds a listener that routes through rt and forwards over
+// pm. defaultMaxLagMS is the bounded-staleness ceiling applied to
+// queries whose consistency hint doesn't carry its own.
+func NewListener(addr string, rt *router.Router, pm *pool.Manager, defaultMaxLagMS int64) *Listener {
+	return &Listener{addr: addr, router: rt, pools: pm, defaultMaxLagMS: defaultMaxLagMS}
 }
 
 // Run starts accepting connections and blocks until ctx is cancelled
@@ -75,11 +79,10 @@ func (l *Listener) handleConn(ctx context.Context, conn net.Conn) {
 	if err := writeAuthenticationOK(rw); err != nil {
 		return
 	}
-	if err := writeParameterStatus(rw, "server_version", "14.0 (dbfabric)"); err != nil {
-		return
-	}
-	if err := writeParameterStatus(rw, "client_encoding", "UTF8"); err != nil {
-		return
+	for _, p := range handshakeParameters(params) {
+		if err := writeParameterStatus(rw, p[0], p[1]); err != nil {
+			return
+		}
 	}
 	if err := writeBackendKeyData(rw, 0, 0); err != nil {
 		return
@@ -103,7 +106,7 @@ func (l *Listener) handleConn(ctx context.Context, conn net.Conn) {
 		switch msgType {
 		case 'Q':
 			query := strings.TrimRight(string(payload), "\x00")
-			if err := handleQuery(ctx, rw, l.router, l.pools, shardKey, query); err != nil {
+			if err := handleQuery(ctx, rw, l.router, l.pools, l.defaultMaxLagMS, shardKey, query); err != nil {
 				return
 			}
 		case 'X':

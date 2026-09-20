@@ -13,7 +13,7 @@ import (
 type Consistency string
 
 const (
-	Strong           Consistency = "strong"           // read from primary
+	Strong           Consistency = "strong"            // read from primary
 	Eventual         Consistency = "eventual"          // read from any (healthy) replica
 	BoundedStaleness Consistency = "bounded_staleness" // read from a replica only if lag <= threshold
 )

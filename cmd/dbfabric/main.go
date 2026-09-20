@@ -8,12 +8,8 @@ import (
 	"os"
 	"os/signal"
 
+	"dbfabric/internal/app"
 	"dbfabric/internal/config"
-	"dbfabric/internal/health"
-	"dbfabric/internal/pool"
-	"dbfabric/internal/proxy"
-	"dbfabric/internal/router"
-	"dbfabric/internal/shardmap"
 )
 
 func main() {
@@ -25,37 +21,12 @@ func main() {
 		log.Fatalf("loading config: %v", err)
 	}
 
-	sm := shardmap.New()
-	rt := router.New(sm)
-	pm := pool.NewManager(pool.Backend{
-		User:     cfg.Backend.User,
-		Password: cfg.Backend.Password,
-		Database: cfg.Backend.Database,
-		SSLMode:  cfg.Backend.SSLMode,
-	})
-	hc := health.NewChecker(sm, pm, cfg.HealthCheckInterval)
-
-	for _, s := range cfg.Shards {
-		shard := &shardmap.Shard{ID: s.ID, Primary: shardmap.Node{Addr: s.Primary}}
-		for _, addr := range s.Replicas {
-			shard.Replicas = append(shard.Replicas, shardmap.Node{Addr: addr})
-		}
-		rt.AddShard(shard)
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	go func() {
-		if err := hc.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("health checker stopped: %v", err)
-		}
-	}()
-
-	lis := proxy.NewListener(cfg.ListenAddr, rt, pm)
 	log.Printf("dbfabric: listening on %s (%d shard(s) loaded from %s)", cfg.ListenAddr, len(cfg.Shards), *configPath)
-	if err := lis.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		log.Fatalf("listener: %v", err)
+	if err := app.New(cfg).Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatalf("dbfabric: %v", err)
 	}
 	log.Println("dbfabric: shut down")
 }

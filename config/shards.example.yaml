@@ -1,8 +1,20 @@
-# Example shard map config — shape that internal/config.Load will parse
-# once YAML loading is implemented. Not read by anything yet.
+# Example shard map config — parsed by internal/config.Load and used by
+# cmd/dbfabric (pass a different file with -config).
 
 listen_addr: ":5433"
 health_check_interval: 2s
+
+# Optional. Every field below is shown with its default.
+health:
+  suspect_after_misses: 1   # consecutive missed heartbeats before SUSPECT
+  down_after_misses: 3      # ...before DOWN (and therefore failover)
+  pg_promote: true          # issue pg_promote() on the replica being promoted
+  quorum_guard: true        # refuse to promote unless a majority of replicas
+                            # also can't see the primary (split-brain guard)
+
+# Optional.
+routing:
+  default_max_lag_ms: 1000  # bounded-staleness ceiling when a hint omits one
 
 backend:
   user: postgres

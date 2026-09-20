@@ -43,7 +43,7 @@ func newTestListener(t *testing.T) (l *Listener, primaryAddr, replicaAddr string
 		Replicas: []shardmap.Node{{Addr: replicaAddr}},
 	})
 	pm := pool.NewManager(pool.Backend{User: "app", Database: "appdb"})
-	return NewListener(":0", rt, pm), primaryAddr, replicaAddr
+	return NewListener(":0", rt, pm, 1000), primaryAddr, replicaAddr
 }
 
 // drainHandshake reads messages until (and including) ReadyForQuery,
@@ -58,6 +58,117 @@ func drainHandshake(t *testing.T, r *bufio.Reader) {
 		if msgType == 'Z' {
 			return
 		}
+	}
+}
+
+// TestHandleConn_HandshakeAnnouncesParametersDriversNeed is a regression
+// test found by the chaos harness: pgx in simple-protocol mode refuses to
+// run any Query unless it has seen standard_conforming_strings=on, and the
+// handshake used to announce only server_version and client_encoding.
+func TestHandleConn_HandshakeAnnouncesParametersDriversNeed(t *testing.T) {
+	l, _, _ := newTestListener(t)
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		l.handleConn(context.Background(), serverConn)
+		close(done)
+	}()
+
+	client := bufio.NewReadWriter(bufio.NewReader(clientConn), bufio.NewWriter(clientConn))
+	startup := buildStartupMessage(map[string]string{"user": "app", "application_name": "user-42"})
+	if _, err := client.Write(startup); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[string]string{}
+	for {
+		msgType, payload, err := readMessage(client.Reader)
+		if err != nil {
+			t.Fatalf("reading handshake message: %v", err)
+		}
+		if msgType == 'S' {
+			// ParameterStatus is exactly "name\0value\0" (no extra
+			// terminator, unlike a startup message's parameter list).
+			kv := strings.Split(strings.TrimSuffix(string(payload), "\x00"), "\x00")
+			if len(kv) != 2 {
+				t.Fatalf("malformed ParameterStatus %q", payload)
+			}
+			got[kv[0]] = kv[1]
+		}
+		if msgType == 'Z' {
+			break
+		}
+	}
+
+	want := map[string]string{
+		"standard_conforming_strings": "on",
+		"client_encoding":             "UTF8",
+		"server_encoding":             "UTF8",
+		"integer_datetimes":           "on",
+		"session_authorization":       "app",
+		"application_name":            "user-42",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("ParameterStatus %q = %q, want %q (all announced: %v)", k, got[k], v, got)
+		}
+	}
+
+	terminate(t, client)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConn did not exit after Terminate")
+	}
+}
+
+// Transaction control must be refused, not forwarded: forwarding it would
+// let a client believe a ROLLBACK had undone writes that were in fact
+// committed (see isTransactionControl). The refusal happens before routing,
+// so it needs no backend, and the connection must stay usable afterward.
+func TestHandleConn_TransactionControlIsRefusedAndConnectionSurvives(t *testing.T) {
+	l, _, _ := newTestListener(t)
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		l.handleConn(context.Background(), serverConn)
+		close(done)
+	}()
+
+	client := bufio.NewReadWriter(bufio.NewReader(clientConn), bufio.NewWriter(clientConn))
+	startup := buildStartupMessage(map[string]string{"user": "app", "application_name": "user-1"})
+	client.Write(startup)
+	client.Flush()
+	drainHandshake(t, client.Reader)
+
+	for _, stmt := range []string{"BEGIN", "-- consistency=eventual\ncommit", "ROLLBACK"} {
+		sendQuery(t, client, stmt)
+
+		msgType, payload, err := readMessage(client.Reader)
+		if err != nil || msgType != 'E' {
+			t.Fatalf("%q: expected ErrorResponse, got %q, err=%v", stmt, msgType, err)
+		}
+		if msg := decodeErrorMessage(t, payload); !strings.Contains(msg, "not supported") {
+			t.Errorf("%q: error message %q should explain that transactions are unsupported", stmt, msg)
+		}
+		msgType, _, err = readMessage(client.Reader)
+		if err != nil || msgType != 'Z' {
+			t.Fatalf("%q: expected ReadyForQuery after the refusal, got %q, err=%v", stmt, msgType, err)
+		}
+	}
+
+	terminate(t, client)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConn did not exit after Terminate")
 	}
 }
 

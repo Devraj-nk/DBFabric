@@ -155,6 +155,32 @@ func writeParameterStatus(w io.Writer, key, value string) error {
 	return writeMessage(w, 'S', payload)
 }
 
+// handshakeParameters returns the ParameterStatus values announced right
+// after authentication.
+//
+// Real drivers read these and refuse to work without some of them — pgx in
+// simple-protocol mode, for one, will not run a query unless it has seen
+// standard_conforming_strings=on. The proxy has no single backend session at
+// handshake time (each query may land on a different node), so these are
+// fixed declarations of what every backend session is expected to use; the
+// values are Postgres's own defaults, which the proxy's text-format result
+// encoding (see formatPGValue) is written to match.
+func handshakeParameters(startup map[string]string) [][2]string {
+	return [][2]string{
+		{"server_version", "14.0 (dbfabric)"},
+		{"server_encoding", "UTF8"},
+		{"client_encoding", "UTF8"},
+		{"DateStyle", "ISO, MDY"},
+		{"IntervalStyle", "postgres"},
+		{"TimeZone", "UTC"},
+		{"integer_datetimes", "on"},
+		{"standard_conforming_strings", "on"},
+		{"is_superuser", "off"},
+		{"session_authorization", startup["user"]},
+		{"application_name", startup["application_name"]},
+	}
+}
+
 func writeBackendKeyData(w io.Writer, pid, secret uint32) error {
 	payload := make([]byte, 8)
 	binary.BigEndian.PutUint32(payload[0:4], pid)
@@ -197,7 +223,7 @@ func writeRowDescription(w io.Writer, columns []string) error {
 		field := make([]byte, 18)
 		// tableOID=0, colAttrNum=0, typeOID=25 (text), typeLen=-1 (variable), typeMod=-1, format=0 (text)
 		binary.BigEndian.PutUint32(field[6:10], 25)
-		binary.BigEndian.PutUint16(field[10:12], 0xFFFF) // int16(-1): variable-length type
+		binary.BigEndian.PutUint16(field[10:12], 0xFFFF)     // int16(-1): variable-length type
 		binary.BigEndian.PutUint32(field[12:16], 0xFFFFFFFF) // int32(-1): no type modifier
 		payload = append(payload, field...)
 	}

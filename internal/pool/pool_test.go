@@ -60,9 +60,51 @@ func TestDrainForcesNewPoolOnNextGet(t *testing.T) {
 	}
 }
 
+func TestDrainAsyncDetachesBeforeReturning(t *testing.T) {
+	m := NewManager(Backend{User: "app", Database: "appdb"})
+
+	p1, err := m.Get(context.Background(), "127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.DrainAsync("127.0.0.1:1")
+
+	// The close may still be running in the background, but the node must
+	// already be unroutable: the very next Get builds a fresh pool.
+	p2, err := m.Get(context.Background(), "127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1 == p2 {
+		t.Error("DrainAsync returned while the old pool was still attached")
+	}
+}
+
 func TestDrainUnknownAddrIsANoop(t *testing.T) {
 	m := NewManager(Backend{User: "app", Database: "appdb"})
 	m.Drain("127.0.0.1:9999") // must not panic
+}
+
+func TestCloseEmptiesEveryPool(t *testing.T) {
+	m := NewManager(Backend{User: "app", Database: "appdb"})
+	p1, err := m.Get(context.Background(), "127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Get(context.Background(), "127.0.0.1:2"); err != nil {
+		t.Fatal(err)
+	}
+
+	m.Close()
+
+	// After Close, Get builds a fresh pool rather than returning a closed one.
+	p1again, err := m.Get(context.Background(), "127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1 == p1again {
+		t.Error("Get returned a pool that Close should have removed")
+	}
 }
 
 func TestBackendDSNShape(t *testing.T) {

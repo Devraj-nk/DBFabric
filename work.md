@@ -407,3 +407,183 @@ today's scale, flagged as a TODO). Build order's remaining item is step 5,
 the chaos test, which this session's manual failover verification is
 already a version of — a more formal/repeatable harness for it would be
 the natural next thing to build.
+
+## Build order step 5 and the "what's left" list: implemented
+
+Everything from the previous entry's "what's left" list is now done:
+config-driven thresholds, parallel pings, real `pg_promote()`, a split-brain
+guard, and the chaos harness. (One item changed shape: the guard could not be a
+quorum *across proxies* because there is still exactly one, so it uses the
+replicas as witnesses instead — see below.) The harness turned out to be the
+most valuable piece: it found bugs in code I had already declared working. They
+are written up honestly below, including where my own earlier claims were wrong.
+
+### What was built
+
+- **Config** (`internal/config`): optional `health:` block
+  (`suspect_after_misses`, `down_after_misses`, `pg_promote`, `quorum_guard`)
+  and `routing.default_max_lag_ms`, with defaults and validation
+  (`suspect >= 1`, `down >= suspect`, lag `>= 0`). Optional fields are pointers
+  in the raw struct so an explicit `false`/`0` is distinguishable from
+  "omitted" — otherwise `quorum_guard: false` would silently become the `true`
+  default. Tested, including that case.
+- **`internal/app`**: the wiring that lived inline in `main.go`, extracted so
+  `main` and the chaos harness build the proxy identically. `Run` also stops the
+  checker and closes every pool on shutdown (new `pool.Manager.Close`).
+- **Health checker** (`internal/health/checker.go`):
+  - Shards are checked in parallel, and within a shard the primary and each
+    replica are pinged in parallel (was: sequential). A per-shard *busy guard*
+    means a shard whose previous check is still running — typically a slow
+    failover — is skipped by later sweeps instead of overlapped; that guard is
+    also what keeps "replace the shard's whole entry" free of lost updates now
+    that more than one goroutine is around. Other shards are never delayed by
+    it.
+  - `Run` sweeps once immediately, then on each tick, each sweep in its own
+    goroutine so a slow one can't delay the next tick.
+  - **Failover now retries while the primary stays DOWN.** The previous version
+    fired only on the up-to-DOWN *transition*, so a promotion that was vetoed,
+    or found no healthy replica, was never attempted again. Repeated identical
+    failures are logged once. A primary that answers again (healed partition)
+    cancels the attempt.
+- **Failover controller** (`failover.go`): guard, then `pg_promote()`, then the
+  shard-map swap, then drain — in that order; on any failure the shard map is
+  untouched.
+  - *Guard:* each non-DOWN replica is asked whether its WAL receiver is still
+    `streaming` (`pg_stat_wal_receiver`). Promote only if a strict majority of
+    the replicas that *answered* cannot see the primary; ties and no answers
+    veto; unreachable replicas abstain. (When unsure, don't make a second
+    primary.)
+  - *`pg_promote(true, 20)`:* SQLSTATE `55000` ("recovery is not in progress")
+    is treated as success, making it idempotent.
+- **A seam for tests** (`backends.go`): a 5-method `backends` interface (`Ping`,
+  `ReplicationLagMS`, `WalReceiverStreaming`, `PgPromote`, `Drain`) over the pgx
+  pools. It exists so the checker/controller logic — miss counting,
+  reset-on-success, veto/retry, promotion ordering, parallelism — now has
+  **hermetic success-path tests** against a fake. The previous entry had to
+  leave "a successful promotion driven by the checker" to manual verification;
+  it no longer does.
+
+### Bugs found, and what I got wrong
+
+1. **The idle-replica lag formula was wrong (mine, previous step).** I computed
+   lag as `now() - pg_last_xact_replay_timestamp()`. On a real replica of an
+   idle primary that reads **4566 ms** (measured) although the replica is fully
+   caught up — it would have excluded every healthy replica from
+   bounded-staleness reads whenever traffic paused. It only looked fine because
+   no earlier test had a real replica. Now: `0` when
+   `pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn()`, else the timestamp
+   difference. Found by probing a hand-built streaming replica *before* writing
+   the harness. Limitation kept honest in the README: this is replay lag
+   against what the replica has received, not receive lag against the primary.
+2. **Premature acknowledgement of column-less statements (mine, previous step;
+   caught by the chaos harness).** `handleQuery` skipped the `rows.Next()` loop
+   when a statement returned no columns (INSERT/UPDATE), then read `rows.Err()`
+   and `rows.CommandTag()` — which pgx documents as valid only after the rows
+   are closed. So the proxy sent `CommandComplete` (with an empty tag) *before
+   the write had finished*. A live primary that never crashed showed "2
+   acknowledged writes missing". **My earlier report that "2 of 1226 acked
+   writes were lost to the async-replication window" was an unproven guess and
+   was probably this bug.** Fixed by extracting `streamResult` and always
+   draining the rows. Regression tests use a fake `pgx.Rows` that reproduces
+   the contract (outcome invisible until closed); I confirmed by mutation
+   (re-introducing the skip) that they fail against the old behavior with
+   exactly the empty-tag / premature-`C` symptom. After the fix: 0 acknowledged
+   writes lost, in every run.
+3. **The handshake announced too few parameters (mine; caught by the
+   harness).** Only `server_version` and `client_encoding` were sent; pgx in
+   simple-protocol mode refuses to run any `Query` without
+   `standard_conforming_strings=on`. Writes worked only because pgx skips that
+   check for argument-less `Exec`. Now a fuller set matching Postgres's defaults
+   is announced, with a regression test.
+4. **Transactions silently broke atomicity (mine; found while verifying README
+   claims, not by the harness).** `BEGIN; INSERT 99; ROLLBACK` left row 99
+   *committed*: each query takes a pooled connection, pgxpool destroys a
+   connection released mid-transaction, so the BEGIN was lost, the INSERT ran in
+   autocommit elsewhere, and the ROLLBACK was a no-op. A silent atomicity
+   violation is worse than an error, so transaction-control statements
+   (`BEGIN/START/COMMIT/END/ROLLBACK/ABORT/SAVEPOINT/RELEASE`, also behind a
+   `-- consistency=` comment) are now refused with an explanatory `0A000` error.
+   **Real transaction support (pinning a backend connection per transaction, and
+   deciding what failover mid-transaction means) is not built and is a genuine
+   design decision — see "open questions".** Also learned in passing: `SET`
+   "worked" across two queries only because the pool handed back the same idle
+   connection; it is not reliable, and the README now says so.
+5. **`pool.Manager.Drain` held its mutex across `pgxpool.Close()`**, which blocks
+   until every checked-out connection is returned — one slow query on a dead
+   node would have frozen `Get` for every other node. And my comment that
+   draining makes in-flight queries "fail fast" was wrong (Close *waits* for
+   them). Fixed: detach under the lock, close outside it; `DrainAsync` detaches
+   synchronously and closes in the background, which is what failover uses so a
+   hung query on the dead primary can't hold up its own replacement. (No test
+   can exercise the blocking close without a live connection, so I removed a
+   test I had written that could not fail, rather than keep false confidence.)
+
+### Chaos harness (`internal/chaos`, build tag `chaos`)
+
+Real `initdb` + `pg_basebackup` streaming replication; the proxy runs
+in-process via `internal/app`; four concurrent at-least-once writers retry an
+insert until acknowledged (so loss and duplication are observable). `make
+chaos`. Kept out of `go test ./...`, which still needs no database.
+
+- **Partition modelling:** a TCP relay between the proxy and a *live* primary.
+  Cutting it makes the primary unreachable to the proxy while it stays up and
+  keeps feeding its replica (whose WAL receiver connects directly). Killing the
+  primary can't produce that situation.
+- **Recovery metric:** longest gap between consecutive acknowledged writes, not
+  "time since `pg_ctl stop` returned" — my first cut measured the latter and
+  under-reported the stall (the primary is already dying during that call).
+
+Final runs (one Windows machine, localhost, PG 18.4, 500 ms sweep, DOWN@3):
+
+| Scenario | Result |
+|---|---|
+| Kill primary mid-burst (5 runs) | stall 1.5-2.0 s; **0** acked writes lost of ~2,000 acked pre-failover per run; 0 duplicates; ~110 client-visible errors |
+| Kill replica | DOWN in ~1.1-1.3 s; **0** write errors; ~25 eventual reads fail in the detection window, 0 after |
+| Partition from live primary, guard on (4 runs) | every attempt vetoed (`1 replica(s) still see primary, 0 cannot`); no promotion; writes stalled ~5.6 s and resumed after heal; 0 lost, 0 duplicates |
+| Same, guard off | split brain reproduced: `{-1:1,-2:0}` on the old primary vs `{-1:0,-2:1}` on the promoted node |
+
+Not proven: loss to asynchronous replication at crash time. Localhost lag is
+sub-millisecond so it did not appear; it remains possible in principle.
+
+**Two test-quality findings worth remembering:**
+- A flaky health test (`SlowFailoverDoesNotBlockOtherShards...`) failed roughly
+  once in a few dozen runs. The code was right and the *test* raced: it waited
+  on a lag value already set by earlier sweeps, so it proceeded before the
+  blocked sweep's shard-b check had finished, and the busy guard correctly
+  skipped it. Fixed with a fresh sentinel value plus an explicit "not busy"
+  wait; then 500 consecutive clean iterations. Found only because I stress-ran
+  (`-count=30`) instead of trusting one green run.
+- A helper hang: `pg_ctl start` output piped into anything deadlocks, because
+  the daemonized server inherits the pipe and holds it open until it exits —
+  `exec.CombinedOutput` would hang identically. The harness sends tool output to
+  files under the test's temp dir (a first version leaked `pgtool-*.log` into
+  `%TEMP%`, since Windows won't delete a file the server still holds open).
+
+### Not done / caveats
+
+- **`go test -race` could not be run**: the installed Go is `windows/386` and the
+  race detector doesn't support it. I reviewed the sharing by hand (per-node
+  results written to distinct slice indexes and read after `WaitGroup.Wait`;
+  shared maps behind `c.mu`), but that is not the same. Installing the 64-bit Go
+  toolchain would enable it.
+- Failover is **routing-state failover with sharp edges**, all now stated in the
+  README: no fencing of the old primary; the old primary isn't re-added and
+  surviving replicas aren't repointed; the guard depends on replicas noticing a
+  dead primary (up to `wal_receiver_timeout`, 60 s, under a *silent* partition);
+  reads sent to a dead replica before its DOWN mark are not retried.
+- **The proxy performs no authentication** and doesn't terminate TLS — the
+  README now leads its limitations with this.
+- Metrics are still a placeholder package.
+- The README "Layout" section you added was stale (said "stubs", "stdlib
+  only"); I corrected it to match the code.
+
+### Open questions for the owner
+
+1. **Transactions.** Pin a backend connection per client transaction (proper,
+   bigger), or keep refusing them (current)? Pinning also forces decisions on
+   failover mid-transaction and on which node a transaction may use.
+2. **Authentication.** Is this meant to stay a trusted-network component, or
+   should it authenticate clients?
+3. **Extended query protocol.** Most drivers default to Parse/Bind/Execute; only
+   the simple protocol works today. Supporting it is the largest remaining gap
+   for real-world clients.
