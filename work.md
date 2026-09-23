@@ -587,3 +587,57 @@ sub-millisecond so it did not appear; it remains possible in principle.
 3. **Extended query protocol.** Most drivers default to Parse/Bind/Execute; only
    the simple protocol works today. Supporting it is the largest remaining gap
    for real-world clients.
+
+
+
+
+
+## Known limitations / future extensions
+
+**Security: the proxy does no authentication.** It answers every client with `AuthenticationOk` and connects to the backends with the single configured `backend` credential, and it does not terminate TLS (`SSLRequest` is answered "no"). Anything that can reach its listen port has that credential's full access. Don't expose it beyond a trusted network until real authentication exists.
+
+**Failover is routing-state failover, with sharp edges.**
+
+- **The old primary is not fenced.** If it is alive but unreachable from the proxy, nothing stops other clients that *can* reach it from continuing to write to it after promotion. The guard makes that situation much less likely to arise (see the chaos results); it does not make it impossible.
+- **The guard's vantage point is the replicas.** With a single proxy there is no second proxy to quorum against, so it asks the replicas. That relies on a replica noticing a dead primary itself; under a *silent* partition (packets dropped) a WAL receiver can take up to `wal_receiver_timeout` (60 s by default) to give up, and the guard errs toward not promoting for that whole window. A hard crash resets the TCP connection and is noticed within about a second.
+- **The old primary is not re-added as a replica when it returns**, and the surviving replicas are **not repointed** at the new primary. After a failover the shard runs with whatever replicas remain (none, in a one-replica shard) until an operator rebuilds it.
+- **Reads routed to a replica between its death and its `DOWN` mark fail**, and are not retried on another node.
+- **Client retry semantics are the client's problem.** A write that errors has an unknown outcome; the proxy never retries it, and a client that does can produce a duplicate (the chaos harness counts these).
+- Lag is *replay* lag against what the replica has received, not receive lag against the primary (see the health-check flow).
+
+**No transactions.** Supporting them means pinning one backend connection to the client for the life of the transaction (as PgBouncer's session/transaction pooling modes do), including deciding what a failover mid-transaction means. That isn't built. It is refused loudly on purpose: when transaction-control statements were merely forwarded, `BEGIN; INSERT …; ROLLBACK` **committed the insert** — pgx's pool destroys a connection released with a transaction open, so the `BEGIN` was lost, the `INSERT` ran in autocommit on another connection, and the `ROLLBACK` was a no-op. A client that thinks it rolled a write back must never find it committed.
+
+**Protocol and query scope.** Text-format results only, and `formatPGValue` matches Postgres's own text output for common types (`bool` as `t`/`f`, integers, strings) but not for everything — dates/timestamps, arrays and composite types can differ. A query goes to exactly one shard: there are no cross-shard queries, scatter-gather, or shard-key extraction from SQL.
+
+**The proxy itself is a single point of failure and a throughput ceiling.**
+Everything above is about making the *database tier* resilient (sharding,
+replica lag, failover of Postgres nodes) — the proxy process that sits in
+front of it isn't resilient by itself yet:
+
+- One proxy instance means one thing to crash. If it dies, every client
+  routed through it loses access to the entire shard fleet at once, even
+  though the underlying Postgres nodes are all healthy.
+- One proxy instance is also a hard throughput ceiling — it can only push as
+  many connections/bytes per second as one process on one machine.
+
+This is a real gap, but a different (and more conventional) problem than the
+one this project explores. The standard fix — how PgBouncer, ProxySQL, and
+Vitess's `vtgate` are actually deployed — is to run **N stateless proxy
+replicas behind a plain L4 load balancer**. That only works cleanly once the
+shard map is no longer private, in-memory state owned by a single process:
+`shardmap.Map`'s doc comment already flags this ("promotable to an external
+store (etcd/Consul) later if the proxy itself needs to run as more than one
+instance"), but that externalization isn't built yet. Until then, this
+project's proxy is a single instance by construction.
+
+Not addressed, and not currently planned as part of the core build order
+above:
+- Externalizing the shard map (etcd/Consul) so multiple proxy instances
+  agree on routing state instead of each holding its own.
+- Running multiple proxy instances behind a load balancer, plus whatever
+  health-checking that LB needs to stop routing to a dead instance.
+- Coordinating failover *decisions* across proxy instances once there's more
+  than one (right now a single checker goroutine owns that; multiple
+  instances all independently "detecting" and "promoting" the same dead
+  primary is its own small distributed-systems problem — likely wanting a
+  lease/leader-election so only one instance drives failover at a time).
